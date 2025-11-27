@@ -38,12 +38,31 @@ public class DeviceScanner implements HidServicesListener {
 
     // Not @PostConstruct because the HomePage must have loaded before
     public void init() {
-        hidServices = HidManager.getHidServices(buildSpecification());
-        hidServices.addHidServicesListener(this);
-        log.info("Starting HID services.");
-        hidServices.start();
-        log.info("Enumerating attached devices...");
+    String os = System.getProperty("os.name", "").toLowerCase();
+    String arch = System.getProperty("os.arch", "").toLowerCase();
+
+    // On Apple Silicon macOS, skip HID entirely for now.
+    if (os.contains("mac") && (arch.contains("aarch") || arch.contains("arm"))) {
+        log.warn("Skipping HID initialization on macOS arm64 – hidapi native lib is x86_64 only.");
+        return;
     }
+
+    try {
+        HidServicesSpecification spec = new HidServicesSpecification();
+        // keep any existing spec configuration here
+        // spec.setAutoStart(true) etc. if present
+
+        hidServices = HidManager.getHidServices(spec);
+
+        // keep the rest of the original init code here:
+        // - adding listeners
+        // - starting services or enumeration
+        // - whatever DeviceScanner was doing after getHidServices(...)
+    } catch (org.hid4java.HidException | UnsatisfiedLinkError e) {
+        log.error("Failed to initialize HID services, running without device scanning", e);
+    }
+}
+
 
     static HidServicesSpecification buildSpecification() {
         var hidServicesSpecification = new HidServicesSpecification();

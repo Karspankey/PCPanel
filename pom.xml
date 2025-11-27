@@ -39,7 +39,7 @@
         <windows.vendor>PCPanel</windows.vendor>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-        <javafx.version>18.0.2</javafx.version>
+        <javafx.version>21.0.6</javafx.version>
         <jna.version>5.13.0</jna.version>
         <asm.version>9.5</asm.version>
 
@@ -93,16 +93,19 @@
             <groupId>org.openjfx</groupId>
             <artifactId>javafx-controls</artifactId>
             <version>${javafx.version}</version>
+            <classifier>mac-aarch64</classifier>
         </dependency>
         <dependency>
             <groupId>org.openjfx</groupId>
             <artifactId>javafx-swing</artifactId>
             <version>${javafx.version}</version>
+            <classifier>mac-aarch64</classifier>
         </dependency>
         <dependency>
             <groupId>org.openjfx</groupId>
             <artifactId>javafx-fxml</artifactId>
             <version>${javafx.version}</version>
+            <classifier>mac-aarch64</classifier>
         </dependency>
         <dependency>
             <groupId>commons-io</groupId>
