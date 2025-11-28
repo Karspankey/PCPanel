@@ -5,10 +5,13 @@ import java.io.IOException;
 
 import org.springframework.stereotype.Service;
 
+import com.getpcpanel.spring.ConditionalOnMac;
+
 import lombok.extern.log4j.Log4j2;
 
 @Log4j2
 @Service
+@ConditionalOnMac
 public class MacPlatformCommand extends IPlatformCommand {
 
     @Override

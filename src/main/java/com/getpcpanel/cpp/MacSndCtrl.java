@@ -2,6 +2,7 @@ package com.getpcpanel.cpp;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -10,18 +11,25 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.springframework.stereotype.Service;
+
+import com.getpcpanel.spring.ConditionalOnMac;
 
 import lombok.extern.log4j.Log4j2;
 
 @Log4j2
 @Service
+@ConditionalOnMac
 public class MacSndCtrl implements ISndCtrl {
     private static final Map<String, AudioDevice> EMPTY_DEVICE_MAP = Collections.emptyMap();
     private static final Collection<AudioDevice> EMPTY_DEVICES = Collections.emptyList();
     private static final Collection<AudioSession> EMPTY_SESSIONS = Collections.emptyList();
     private static final List<RunningApplication> EMPTY_APPS = Collections.emptyList();
+
+    /** Cache bundle-id -> app path so we do not shell out repeatedly. */
+    private final Map<String, File> bundleIdPathCache = new ConcurrentHashMap<>();
 
     // Cached list of running applications at startup
     private volatile List<RunningApplication> runningApplications = EMPTY_APPS;
@@ -57,13 +65,13 @@ public class MacSndCtrl implements ISndCtrl {
 
     @Override
     public void setDeviceVolume(String deviceId, float volume) {
-        // TODO: implement via CoreAudio or a native helper if you ever want real per-device volume
-        log.debug("setDeviceVolume({}, {}) – not implemented on macOS yet", deviceId, volume);
+        // macOS does not expose per-device volume without a native helper; drive the master output instead.
+        setSystemOutputVolume(volume);
     }
 
     @Override
     public void muteDevice(String deviceId, MuteType mute) {
-        log.debug("muteDevice({}, {}) – not implemented on macOS yet", deviceId, mute);
+        setSystemMute(mute == MuteType.mute);
     }
 
     @Override
@@ -75,17 +83,18 @@ public class MacSndCtrl implements ISndCtrl {
 
     @Override
     public void setProcessVolume(String fileName, String device, float volume) {
-        log.debug("setProcessVolume({}, {}, {}) – not implemented on macOS yet", fileName, device, volume);
+        // Without per-app audio control, fall back to master volume so the dial still does something useful.
+        setSystemOutputVolume(volume);
     }
 
     @Override
     public void setFocusVolume(float volume) {
-        log.debug("setFocusVolume({}) – not implemented on macOS yet", volume);
+        setSystemOutputVolume(volume);
     }
 
     @Override
     public void muteProcesses(Set<String> fileNames, MuteType mute) {
-        log.debug("muteProcesses({}, {}) – not implemented on macOS yet", fileNames, mute);
+        setSystemMute(mute == MuteType.mute);
     }
 
     @Override
@@ -102,8 +111,10 @@ public class MacSndCtrl implements ISndCtrl {
                 String line = reader.readLine();
                 if (line != null && !line.isBlank()) {
                     String bundleId = line.trim();
-                    log.debug("Frontmost application (macOS): {}", bundleId);
-                    return bundleId;
+                    var path = resolveBundlePath(bundleId);
+                    String result = path != null ? path.getAbsolutePath() : bundleId;
+                    log.debug("Frontmost application (macOS): {}", result);
+                    return result;
                 }
             }
 
@@ -120,7 +131,8 @@ public class MacSndCtrl implements ISndCtrl {
 
     @Override
     public List<RunningApplication> getRunningApplications() {
-        // Just return the cached snapshot for now
+        // Refresh on every call so the UI stays in sync with current running apps
+        runningApplications = loadRunningApplicationsFromAppleScript();
         return List.copyOf(runningApplications);
     }
 
@@ -216,14 +228,11 @@ public class MacSndCtrl implements ISndCtrl {
                     continue;
                 }
 
-                // We don't have a real executable path here, so we stuff the bundle id into the "file" field
-                // as a placeholder. The 'name' field is the user-visible name.
-                File file = new File(bundle != null ? bundle : name);
-
-                apps.add(new RunningApplication(pid, file, name));
+                File executable = resolveExecutable(bundle, pid, name);
+                apps.add(new RunningApplication(pid, executable, name));
             }
 
-            log.info("Parsed running applications from AppleScript: {}", apps);
+            log.debug("Parsed running applications from AppleScript: {}", apps);
             return apps;
         } catch (Exception e) {
             log.error("Error querying running apps via AppleScript", e);
@@ -241,5 +250,102 @@ public class MacSndCtrl implements ISndCtrl {
             return s.substring(1, s.length() - 1);
         }
         return s;
+    }
+
+    private File resolveExecutable(String bundleId, int pid, String name) {
+        // Prefer bundle path (fast + stable), fallback to ps command, then name as last resort.
+        var byBundle = resolveBundlePath(bundleId);
+        if (byBundle != null) {
+            return byBundle;
+        }
+
+        var fromPs = resolveProcessPath(pid);
+        if (fromPs != null) {
+            return fromPs;
+        }
+
+        return new File(name);
+    }
+
+    private File resolveBundlePath(String bundleId) {
+        if (bundleId == null || bundleId.isBlank() || "missing value".equalsIgnoreCase(bundleId)) {
+            return null;
+        }
+
+        var cached = bundleIdPathCache.get(bundleId);
+        if (cached != null && cached.exists()) {
+            return cached;
+        }
+
+        List<String> candidates = new ArrayList<>();
+        Collections.addAll(candidates, "/Applications", System.getProperty("user.home") + "/Applications");
+
+        for (String base : candidates) {
+            var found = runAndCapture("mdfind", "-onlyin", base, "kMDItemCFBundleIdentifier == \"" + bundleId + "\"");
+            if (found != null && !found.isBlank()) {
+                var path = new File(found.trim());
+                if (path.exists()) {
+                    bundleIdPathCache.put(bundleId, path);
+                    return path;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private File resolveProcessPath(int pid) {
+        var output = runAndCapture("ps", "-p", Integer.toString(pid), "-o", "command=");
+        if (output == null || output.isBlank()) {
+            return null;
+        }
+
+        // The command line is first token; strip after whitespace so /Applications/Foo.app/Contents/MacOS/Foo --flag → path
+        String cmdLine = output.trim();
+        int spaceIdx = cmdLine.indexOf(' ');
+        String pathPart = spaceIdx > 0 ? cmdLine.substring(0, spaceIdx) : cmdLine;
+        File path = new File(pathPart);
+        if (path.exists()) {
+            return path;
+        }
+        return null;
+    }
+
+    private void setSystemOutputVolume(float volume) {
+        int vol = Math.max(0, Math.min(100, Math.round(volume * 100)));
+        run("osascript", "-e", "set volume output volume " + vol);
+    }
+
+    private void setSystemMute(boolean mute) {
+        String script = mute ? "set volume with output muted" : "set volume output muted false";
+        run("osascript", "-e", script);
+    }
+
+    private void run(String... cmd) {
+        try {
+            new ProcessBuilder(cmd).start();
+        } catch (IOException e) {
+            log.warn("Command failed: {}", String.join(" ", cmd), e);
+        }
+    }
+
+    private String runAndCapture(String... cmd) {
+        try {
+            Process p = new ProcessBuilder(cmd).start();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                String line = reader.readLine();
+                if (line != null) {
+                    p.waitFor();
+                    return line;
+                }
+            }
+            p.waitFor();
+        } catch (IOException e) {
+            log.warn("Command failed: {}", String.join(" ", cmd), e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Command interrupted: {}", String.join(" ", cmd));
+        }
+        return null;
     }
 }
