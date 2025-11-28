@@ -11,21 +11,35 @@ import org.springframework.web.client.RestTemplate;
 import com.getpcpanel.profile.SaveService;
 
 import jakarta.annotation.PostConstruct;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 import one.util.streamex.StreamEx;
 
 @Log4j2
 @Service
-@RequiredArgsConstructor
 public class VersionChecker extends Thread {
     private final ApplicationEventPublisher eventPublisher;
     private final SaveService save;
     private final RestTemplate webClient;
-    @Value("https://api.github.com/repos/${application.github.user-and-repo}/releases?per_page=2") private final String versionCheck;
-    @Value("${application.version}") private final String version;
-    @Value("${application.build}") private final int build;
-    @Value("#{'${application.version}'.endsWith('" + SNAPSHOT_POSTFIX + "')}") private final boolean currentIsSnapshot;
+    private final String versionCheck;
+    private final String version;
+    private final int build;
+    private final boolean currentIsSnapshot;
+
+    public VersionChecker(ApplicationEventPublisher eventPublisher,
+                          SaveService save,
+                          RestTemplate webClient,
+                          @Value("https://api.github.com/repos/${application.github.user-and-repo}/releases?per_page=2") String versionCheck,
+                          @Value("${application.version}") String version,
+                          @Value("${application.build}") int build,
+                          @Value("#{'${application.version}'.endsWith('" + SNAPSHOT_POSTFIX + "')}") boolean currentIsSnapshot) {
+        this.eventPublisher = eventPublisher;
+        this.save = save;
+        this.webClient = webClient;
+        this.versionCheck = versionCheck;
+        this.version = version;
+        this.build = build;
+        this.currentIsSnapshot = currentIsSnapshot;
+    }
 
     @PostConstruct
     public void init() {

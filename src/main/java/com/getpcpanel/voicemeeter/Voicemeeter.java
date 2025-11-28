@@ -221,8 +221,8 @@ public final class Voicemeeter {
         }, null);
     }
 
-    @Contract("_, !null -> !null")
-    private <T> @Nullable T disconnectIfDisconnectError(VoiceMeeterExceptionThrowingSupplier<T> r, @Nullable T defaultValue) {
+    @Nullable
+    private <T> T disconnectIfDisconnectError(VoiceMeeterExceptionThrowingSupplier<T> r, @Nullable T defaultValue) {
         try {
             return r.get();
         } catch (VoicemeeterException vme) {
@@ -372,4 +372,3 @@ public final class Voicemeeter {
         void run() throws VoicemeeterException;
     }
 }
-

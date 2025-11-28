@@ -19,6 +19,7 @@ import org.apache.commons.lang3.math.NumberUtils;
 import org.apache.logging.log4j.util.TriConsumer;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.core.annotation.Order;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
 import com.getpcpanel.device.Device;
@@ -41,6 +42,7 @@ import one.util.streamex.StreamEx;
 @Log4j2
 @Service
 @Order(1)
+@ConditionalOnProperty(name = "pcpanel.mqtt.enabled", havingValue = "true", matchIfMissing = false)
 @RequiredArgsConstructor
 public class MqttDeviceColorService implements IOverrideColorProviderProvider {
     public static final String EFFECT_NONE = "none";

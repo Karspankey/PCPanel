@@ -36,7 +36,7 @@ public class FxHelper {
         return loader;
     }
 
-    public <P, T extends UIInitializer<P>> @Nonnull T open(@Nonnull Class<T> dialogClass, @Nullable P params) {
+    public <P, T extends UIInitializer<P>> T open(@Nonnull Class<T> dialogClass, @Nullable P params) {
         var loader = getLoader(getClass().getResource("/assets/%s.fxml".formatted(dialogClass.getSimpleName())));
         try {
             loader.load();

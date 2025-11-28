@@ -3,7 +3,6 @@ package com.getpcpanel.commands;
 import static com.getpcpanel.cpp.AudioSession.SYSTEM;
 
 import java.io.File;
-import java.util.HashMap;
 import java.util.Objects;
 import java.util.function.BiFunction;
 
@@ -141,28 +140,35 @@ public class IconService {
         return OBS;
     }
 
-    private class SafeMap extends HashMap<Class<? extends Command>, BiFunction<IconService, ? extends Command, Image>> {
+    private class SafeMap {
+        private final java.util.Map<Class<?>, BiFunction<IconService, Command, Image>> map = new java.util.HashMap<>();
 
         public <T extends Command> void put(Class<T> key, BiFunction<IconService, T, Image> value) {
-            super.put(key, value);
+            //noinspection unchecked
+            map.put(key, (BiFunction<IconService, Command, Image>) value);
         }
 
         public <T extends Command> Image handle(T icon) {
             if (icon == null)
                 return DEFAULT;
 
-            //noinspection unchecked
-            return ((BiFunction<IconService, T, Image>) ensureHandler(icon.getClass())).apply(IconService.this, icon);
+            return ensureHandler(icon.getClass()).apply(IconService.this, icon);
         }
 
         @SuppressWarnings("unchecked")
-        private <T> BiFunction<IconService, T, Image> ensureHandler(Class<T> icon) {
-            if (imageHandlers.containsKey(icon)) {
-                return (BiFunction<IconService, T, Image>) imageHandlers.get(icon);
+        private BiFunction<IconService, Command, Image> ensureHandler(Class<?> icon) {
+            if (icon == null || icon == Object.class) {
+                return (svc, cmd) -> DEFAULT;
+            }
+            var existing = map.get(icon);
+            if (existing != null) {
+                return existing;
             }
 
-            var handler = (BiFunction<IconService, T, Image>) ensureHandler(icon.getSuperclass());
-            imageHandlers.put((Class<? extends Command>) icon, (BiFunction<IconService, ? extends Command, Image>) handler);
+            var handler = ensureHandler(icon.getSuperclass());
+            if (Command.class.isAssignableFrom(icon)) {
+                map.put(icon, handler);
+            }
             return handler;
         }
     }

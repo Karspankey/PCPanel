@@ -11,6 +11,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 import java.util.regex.Matcher;
@@ -19,6 +20,8 @@ import java.util.regex.Pattern;
 import org.springframework.stereotype.Service;
 
 import com.getpcpanel.spring.ConditionalOnMac;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import lombok.extern.log4j.Log4j2;
 
@@ -35,19 +38,65 @@ public class MacSndCtrl implements ISndCtrl {
     private static final Pattern LSAPP_NAME = Pattern.compile("name:\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
     private static final Pattern LSAPP_BUNDLE = Pattern.compile("bundleID:\"?([^\"]+)\"?", Pattern.CASE_INSENSITIVE);
     private static final Pattern LSAPP_EXEC = Pattern.compile("executable\\s+path:\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /** Cache bundle-id -> app path so we do not shell out repeatedly. */
     private final Map<String, File> bundleIdPathCache = new ConcurrentHashMap<>();
     private volatile int lastSystemVolume = -1;
     private volatile long lastSystemVolumeMs = 0L;
+    private final String bgmPath;
+    private final boolean bgmAppleScriptAvailable;
 
     // Cached list of running applications at startup
     private volatile List<RunningApplication> runningApplications = EMPTY_APPS;
 
     public MacSndCtrl() {
         log.info("MacSndCtrl initialized on macOS – testing running application detection");
-        this.runningApplications = loadRunningApplicationsFromAppleScript();
+        this.bgmPath = locateBgm();
+        this.bgmAppleScriptAvailable = hasBgmApp();
+        if (bgmPath != null) {
+            log.info("Background Music detected at {}", bgmPath);
+        } else if (bgmAppleScriptAvailable) {
+            log.info("Background Music app detected (AppleScript control available), but bgm CLI not found");
+        } else {
+            log.info("Background Music not found; using system volume fallback");
+        }
+        this.runningApplications = loadRunningApplications();
         log.info("MacSndCtrl initial running apps: {}", this.runningApplications);
+    }
+
+    private String locateBgm() {
+        List<String> candidates = new ArrayList<>();
+        var env = System.getenv("BGM_PATH");
+        if (env != null) {
+            candidates.add(env);
+        }
+        candidates.add("/opt/homebrew/bin/bgm");
+        candidates.add("/usr/local/bin/bgm");
+
+        // 'which bgm'
+        var fromWhich = runAndCapture("which", "bgm");
+        if (fromWhich != null && !fromWhich.isBlank()) {
+            candidates.add(fromWhich.trim());
+        }
+
+        for (String c : candidates) {
+            if (c == null || c.isBlank()) {
+                continue;
+            }
+            File f = new File(c.trim());
+            if (f.exists() && f.canExecute()) {
+                return f.getAbsolutePath();
+            }
+        }
+        return null;
+    }
+
+    private boolean hasBgmApp() {
+        List<String> candidates = new ArrayList<>();
+        candidates.add("/Applications/Background Music.app");
+        candidates.add(System.getProperty("user.home") + "/Applications/Background Music.app");
+        return candidates.stream().anyMatch(p -> new File(p).exists());
     }
 
     // ---------- ISndCtrl: devices ----------
@@ -93,17 +142,53 @@ public class MacSndCtrl implements ISndCtrl {
 
     @Override
     public void setProcessVolume(String fileName, String device, float volume) {
+        if (bgmPath != null && setBgmVolume(fileName, volume)) {
+            return;
+        }
+        if (bgmAppleScriptAvailable && setBgmVolumeViaAppleScript(fileName, volume)) {
+            return;
+        }
         // Without per-app audio control, fall back to master volume so the dial still does something useful.
         setSystemOutputVolume(volume);
     }
 
     @Override
     public void setFocusVolume(float volume) {
+        if (bgmPath != null) {
+            var focus = getFocusApplication();
+            if (focus != null && setBgmVolume(focus, volume)) {
+                return;
+            }
+        }
+        if (bgmAppleScriptAvailable) {
+            var focus = getFocusApplication();
+            if (focus != null && setBgmVolumeViaAppleScript(focus, volume)) {
+                return;
+            }
+        }
         setSystemOutputVolume(volume);
     }
 
     @Override
     public void muteProcesses(Set<String> fileNames, MuteType mute) {
+        if (bgmPath != null) {
+            boolean handled = false;
+            for (String name : fileNames) {
+                handled = setBgmMute(name, mute == MuteType.mute) || handled;
+            }
+            if (handled) {
+                return;
+            }
+        }
+        if (bgmAppleScriptAvailable) {
+            boolean handled = false;
+            for (String name : fileNames) {
+                handled = setBgmMuteViaAppleScript(name, mute == MuteType.mute) || handled;
+            }
+            if (handled) {
+                return;
+            }
+        }
         setSystemMute(mute == MuteType.mute);
     }
 
@@ -250,11 +335,153 @@ public class MacSndCtrl implements ISndCtrl {
         }
     }
 
+    private List<RunningApplication> loadRunningApplicationsFromBgm() {
+        List<RunningApplication> apps = new ArrayList<>();
+        if (bgmPath == null) {
+            return bgmAppleScriptAvailable ? loadRunningApplicationsFromBgmAppleScript() : apps;
+        }
+
+        String output = runBgmAndCapture("list-apps", "--json");
+        if (output == null || output.isBlank()) {
+            output = runBgmAndCapture("--list-apps", "--json"); // alternate ordering
+        }
+        if (output == null || output.isBlank()) {
+            output = runBgmAndCapture("list-apps"); // fallback to text
+        }
+
+        if (output == null || output.isBlank()) {
+            return apps;
+        }
+
+        boolean parsed = false;
+        try {
+            JsonNode root = MAPPER.readTree(output);
+            if (root.isArray()) {
+                for (JsonNode node : root) {
+                    int pid = node.path("pid").asInt(-1);
+                    if (pid < 0) {
+                        continue;
+                    }
+                    String bundle = firstNonBlank(node.path("bundleId").asText(null),
+                                                  node.path("bundleID").asText(null),
+                                                  node.path("id").asText(null));
+                    String name = firstNonBlank(node.path("name").asText(null),
+                                                node.path("title").asText(null),
+                                                bundle);
+                    String execPath = node.path("executablePath").asText(null);
+
+                    File executable = null;
+                    if (execPath != null && !execPath.isBlank()) {
+                        var f = new File(execPath);
+                        if (f.exists()) {
+                            executable = f;
+                        }
+                    }
+                    if (executable == null) {
+                        executable = resolveBundlePath(bundle);
+                    }
+                    if (executable == null && bundle != null && bundle.contains(File.separator)) {
+                        var f = new File(bundle);
+                        if (f.exists()) {
+                            executable = f;
+                        }
+                    }
+                    if (executable == null) {
+                        executable = new File(name != null ? name : ("pid-" + pid));
+                    }
+
+                    apps.add(new RunningApplication(pid, executable, name != null ? name : executable.getName()));
+                }
+                parsed = true;
+            }
+        } catch (Exception e) {
+            log.debug("Failed to parse bgm list-apps json", e);
+        }
+
+        if (parsed) {
+            return apps;
+        }
+
+        // Very simple text fallback: assume first token is pid, second is name
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(new java.io.ByteArrayInputStream(output.getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.isBlank()) {
+                    continue;
+                }
+                String[] parts = line.split("\\s+");
+                if (parts.length < 2) {
+                    continue;
+                }
+                int pid;
+                try {
+                    pid = Integer.parseInt(parts[0]);
+                } catch (NumberFormatException ex) {
+                    continue;
+                }
+                String name = parts[1];
+                File executable = resolveExecutable(null, pid, name);
+                apps.add(new RunningApplication(pid, executable, name));
+            }
+        } catch (IOException e) {
+            log.debug("Failed to parse bgm text output", e);
+        }
+
+        return apps;
+    }
+
+    private List<RunningApplication> loadRunningApplicationsFromBgmAppleScript() {
+        List<RunningApplication> apps = new ArrayList<>();
+        if (!bgmAppleScriptAvailable) {
+            return apps;
+        }
+
+        String script = """
+            set outText to ""
+            tell application "Background Music"
+                set nameList to name of every audio application
+                set bundleList to bundleID of every audio application
+            end tell
+            set len to (count of nameList)
+            repeat with i from 1 to len
+                set outText to outText & (item i of nameList) & "|" & (item i of bundleList) & linefeed
+            end repeat
+            return outText
+            """;
+
+        String output = runAndCapture("osascript", "-e", script);
+        if (output == null || output.isBlank()) {
+            return apps;
+        }
+
+        for (String line : output.split("\\R")) {
+            if (line.isBlank()) {
+                continue;
+            }
+            String[] parts = line.split("\\|", 2);
+            String name = parts[0];
+            String bundle = parts.length > 1 ? parts[1] : null;
+            File exec = resolveBundlePath(bundle);
+            if (exec == null) {
+                exec = new File(name);
+            }
+            apps.add(new RunningApplication(0, exec, name));
+        }
+
+        return apps;
+    }
+
     /**
      * Try AppleScript first (best names/icons), then fall back to ps-based discovery
      * so we still show something even if accessibility permissions are missing.
      */
     private List<RunningApplication> loadRunningApplications() {
+        var fromBgm = loadRunningApplicationsFromBgm();
+        if (!fromBgm.isEmpty()) {
+            return fromBgm;
+        }
+
         var fromAppleScript = loadRunningApplicationsFromAppleScript();
         if (!fromAppleScript.isEmpty()) {
             return fromAppleScript;
@@ -505,6 +732,117 @@ public class MacSndCtrl implements ISndCtrl {
         run("osascript", "-e", script);
     }
 
+    private boolean setBgmVolume(String target, float volume) {
+        if (bgmPath == null) {
+            return false;
+        }
+        String normalized = normalizeTarget(target);
+        if (normalized == null) {
+            return false;
+        }
+        String volStr = String.format(Locale.US, "%.3f", Math.max(0f, Math.min(1f, volume)));
+        String output = runBgmAndCapture("set-app-volume", normalized, volStr);
+        if (output == null) {
+            log.debug("bgm set-app-volume returned null for {}", normalized);
+            return false;
+        }
+        return true;
+    }
+
+    private boolean setBgmMute(String target, boolean mute) {
+        if (bgmPath == null) {
+            return false;
+        }
+        String normalized = normalizeTarget(target);
+        if (normalized == null) {
+            return false;
+        }
+        String muteStr = mute ? "on" : "off";
+        String output = runBgmAndCapture("set-app-mute", normalized, muteStr);
+        if (output == null) {
+            log.debug("bgm set-app-mute returned null for {}", normalized);
+            return false;
+        }
+        return true;
+    }
+
+    private boolean setBgmVolumeViaAppleScript(String target, float volume) {
+        if (!bgmAppleScriptAvailable) {
+            return false;
+        }
+        String normalized = normalizeTarget(target);
+        if (normalized == null) {
+            return false;
+        }
+        int vol = Math.max(0, Math.min(100, Math.round(volume * 100)));
+        String escaped = escapeAppleScriptString(normalized);
+        String script = """
+            tell application "Background Music"
+                repeat with a in audio applications
+                    if (bundleID of a is "%s") or (name of a is "%s") then
+                        set vol of a to %d
+                        return "ok"
+                    end if
+                end repeat
+            end tell
+            return "notfound"
+            """.formatted(escaped, escaped, vol);
+        String output = runAndCapture("osascript", "-e", script);
+        return output != null && output.contains("ok");
+    }
+
+    private boolean setBgmMuteViaAppleScript(String target, boolean mute) {
+        if (!bgmAppleScriptAvailable) {
+            return false;
+        }
+        String normalized = normalizeTarget(target);
+        if (normalized == null) {
+            return false;
+        }
+        int vol = mute ? 0 : 100;
+        return setBgmVolumeViaAppleScript(normalized, vol / 100f);
+    }
+
+    private String normalizeTarget(String target) {
+        if (target == null || target.isBlank()) {
+            return null;
+        }
+
+        // If a path is provided, try to turn it into a bundle identifier (preferred by bgm)
+        if (target.contains(File.separator)) {
+            File f = new File(target);
+            if (f.exists()) {
+                var bid = bundleIdentifierFromPath(f);
+                if (bid != null) {
+                    return bid;
+                }
+                return f.getName();
+            }
+        }
+
+        // If it already looks like a bundle id, use it as-is
+        if (target.contains(".")) {
+            return target;
+        }
+
+        return target;
+    }
+
+    private String bundleIdentifierFromPath(File app) {
+        if (app == null || !app.exists()) {
+            return null;
+        }
+        var output = runAndCapture("mdls", "-raw", "-name", "kMDItemCFBundleIdentifier", app.getAbsolutePath());
+        if (output == null || output.isBlank()) {
+            return null;
+        }
+        var trimmed = output.trim();
+        if ("(null)".equalsIgnoreCase(trimmed)) {
+            return null;
+        }
+        return trimmed;
+    }
+
     private void run(String... cmd) {
         try {
             new ProcessBuilder(cmd).start();
@@ -534,6 +872,32 @@ public class MacSndCtrl implements ISndCtrl {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             log.warn("Command interrupted: {}", String.join(" ", cmd));
+        }
+        return null;
+    }
+
+    private String runBgmAndCapture(String... args) {
+        if (bgmPath == null) {
+            return null;
+        }
+        String[] cmd = new String[args.length + 1];
+        cmd[0] = bgmPath;
+        System.arraycopy(args, 0, cmd, 1, args.length);
+        return runAndCapture(cmd);
+    }
+
+    private static String escapeAppleScriptString(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) {
+            return null;
+        }
+        for (String v : values) {
+            if (v != null && !v.isBlank()) {
+                return v;
+            }
         }
         return null;
     }

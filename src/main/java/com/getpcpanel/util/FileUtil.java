@@ -11,12 +11,13 @@ import lombok.extern.log4j.Log4j2;
 
 @Log4j2
 @Service
-@RequiredArgsConstructor
 public class FileUtil {
-    @Value("${application.root}") private final File root;
+    @Value("${application.root:${user.home}/.pcpanel}") private String rootPath;
+    private File root;
 
     @PostConstruct
     void ensureRoot() {
+        root = new File(rootPath);
         log.info("Using root: {}", root);
         if (!root.exists() && !root.mkdirs()) {
             log.error("Unable to create file root: {}", root);

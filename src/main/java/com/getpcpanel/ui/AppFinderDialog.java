@@ -148,11 +148,12 @@ public class AppFinderDialog extends Application implements UIInitializer<AppFin
             flowPane.setPrefHeight(bounds.getHeight());
         });
         var font = new Font(18.0D);
-        try {
-            var apps = getProgs();
-            for (var app : apps) {
+        var apps = getProgs();
+        for (var app : apps) {
+            try {
                 var iv = getImage(app);
-                var button = new Button(app.title(), iv);
+                var title = StringUtils.defaultString(app.title(), app.executable().getName());
+                var button = new Button(title, iv);
                 var size = 180;
                 var ivSize = 64;
                 iv.minHeight(ivSize);
@@ -171,11 +172,11 @@ public class AppFinderDialog extends Application implements UIInitializer<AppFin
                     stage.close();
                 });
                 allProgs.add(new ButtonTitleExe(button, app.title(), app.executable().getName()));
+            } catch (Exception e) {
+                log.warn("Skipping app '{}' due to UI error", app.title(), e);
             }
-            StreamEx.of(allProgs).map(ButtonTitleExe::button).toListAndThen(flowPane.getChildren()::addAll);
-        } catch (Exception e) {
-            log.error("Unable to add app-buttons", e);
         }
+        StreamEx.of(allProgs).map(ButtonTitleExe::button).toListAndThen(flowPane.getChildren()::addAll);
     }
 
     @FXML

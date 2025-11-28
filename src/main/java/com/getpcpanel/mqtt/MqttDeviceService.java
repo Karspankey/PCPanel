@@ -16,6 +16,7 @@ import java.util.function.Function;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.event.EventListener;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Service;
@@ -40,6 +41,7 @@ import one.util.streamex.EntryStream;
 
 @Log4j2
 @Service
+@ConditionalOnProperty(name = "pcpanel.mqtt.enabled", havingValue = "true", matchIfMissing = false)
 @RequiredArgsConstructor
 public class MqttDeviceService {
     private final MqttService mqtt;
