@@ -17,7 +17,7 @@ import org.springframework.stereotype.Service;
  * This lets PCPanel start on macOS even though the Windows SndCtrl.dll
  * backend is not available. All methods are currently no-ops.
  */
-@Service
+// @Service //
 @ConditionalOnMissingBean(ISndCtrl.class)
 public class MacNoopSndCtrl implements ISndCtrl {
     private static final Logger log = LoggerFactory.getLogger(MacNoopSndCtrl.class);

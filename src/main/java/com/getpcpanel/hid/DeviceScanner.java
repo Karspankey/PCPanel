@@ -38,31 +38,35 @@ public class DeviceScanner implements HidServicesListener {
 
     // Not @PostConstruct because the HomePage must have loaded before
     public void init() {
-    String os = System.getProperty("os.name", "").toLowerCase();
-    String arch = System.getProperty("os.arch", "").toLowerCase();
+        // On Apple Silicon macOS we used to skip HID because the native lib was x86_64-only.
+        // Now that we have a darwin-aarch64 hidapi in the JAR, we don't skip anymore.
 
-    // On Apple Silicon macOS, skip HID entirely for now.
-    if (os.contains("mac") && (arch.contains("aarch") || arch.contains("arm"))) {
-        log.warn("Skipping HID initialization on macOS arm64 – hidapi native lib is x86_64 only.");
-        return;
+        try {
+            HidServicesSpecification spec = buildSpecification();
+            hidServices = HidManager.getHidServices(spec);
+
+            // Register this scanner as listener so attach/detach/failure events fire
+            hidServices.addHidServicesListener(this);
+
+            log.info("HID: Listing attached devices...");
+            for (HidDevice d : hidServices.getAttachedHidDevices()) {
+                log.info("HID device: vendorId=0x{}, productId=0x{}, path={}, manufacturer={}, product={}",
+                         Integer.toHexString(d.getVendorId()),
+                         Integer.toHexString(d.getProductId()),
+                         d.getPath(),
+                         d.getManufacturer(),
+                         d.getProduct());
+
+                // If it's a PCPanel, register it immediately
+                determineType(d).ifPresent(type -> foundPCPanel(d, type));
+            }
+
+            // Start background scanning
+            hidServices.start();
+        } catch (org.hid4java.HidException | UnsatisfiedLinkError e) {
+            log.error("Failed to initialize HID services, running without device scanning", e);
+        }
     }
-
-    try {
-        HidServicesSpecification spec = new HidServicesSpecification();
-        // keep any existing spec configuration here
-        // spec.setAutoStart(true) etc. if present
-
-        hidServices = HidManager.getHidServices(spec);
-
-        // keep the rest of the original init code here:
-        // - adding listeners
-        // - starting services or enumeration
-        // - whatever DeviceScanner was doing after getHidServices(...)
-    } catch (org.hid4java.HidException | UnsatisfiedLinkError e) {
-        log.error("Failed to initialize HID services, running without device scanning", e);
-    }
-}
-
 
     static HidServicesSpecification buildSpecification() {
         var hidServicesSpecification = new HidServicesSpecification();
@@ -77,9 +81,16 @@ public class DeviceScanner implements HidServicesListener {
     public void deviceAdded(@NonNull String key, @NonNull HidDevice device, DeviceType deviceType) {
         if (!device.isOpen()) {
             if (!device.open()) {
-                log.error("Unable to open device, it won't be possible to use the panel");
+                log.error("Unable to open device {} (vid=0x{}, pid=0x{}), lastError={}",
+                          key,
+                          Integer.toHexString(device.getVendorId()),
+                          Integer.toHexString(device.getProductId()),
+                          device.getLastErrorMessage());
+                // Do NOT continue with a closed device – no reader/writer threads
+                return;
             }
         }
+
         var deviceHandler = deviceCommunicationHandlerFactory.build(key, device, deviceType);
         connectedDeviceMap.put(key, deviceHandler);
         deviceHandler.start();
@@ -94,13 +105,20 @@ public class DeviceScanner implements HidServicesListener {
     }
 
     private void foundPCPanel(HidDevice newPCPanel, DeviceType deviceType) {
+        String serial = newPCPanel.getSerialNumber();
+        if (connectedDeviceMap.containsKey(serial)) {
+            log.info("PCPanel {} already connected, ignoring duplicate FOUND event", serial);
+            return;
+        }
+
         log.info("FOUND PCPANEL : {}", newPCPanel);
         try {
-            deviceAdded(newPCPanel.getSerialNumber(), newPCPanel, deviceType);
+            deviceAdded(serial, newPCPanel, deviceType);
         } catch (Exception e) {
             log.error("Unable to handle device added", e);
         }
     }
+
 
     private void lostPCPanel(HidDevice lostPCPanel) {
         log.info("LOST PCPANEL : {}", lostPCPanel);
@@ -110,6 +128,8 @@ public class DeviceScanner implements HidServicesListener {
             log.error("Unable to handle device disconnect", e);
         }
     }
+
+    // ---- HidServicesListener implementation ----
 
     @Override
     public void hidDeviceAttached(HidServicesEvent event) {
@@ -126,17 +146,34 @@ public class DeviceScanner implements HidServicesListener {
         determineType(event).ifPresent(type -> lostPCPanel(event.getHidDevice()));
     }
 
-    private Optional<DeviceType> determineType(HidServicesEvent event) {
+    @Override
+    public void hidDataReceived(HidServicesEvent event) {
+        // Optional debug
+        log.debug("HID data received from {}", event.getHidDevice());
+    }
+
+    // ---- Helpers ----
+
+    /** Determine device type from a HidDevice */
+    private Optional<DeviceType> determineType(HidDevice device) {
         for (var deviceType : DeviceType.ALL) {
-            if (event.getHidDevice().isVidPidSerial(deviceType.getVid(), deviceType.getPid(), null))
+            if (device.isVidPidSerial(deviceType.getVid(), deviceType.getPid(), null)) {
                 return Optional.of(deviceType);
+            }
         }
         return Optional.empty();
     }
 
+    /** Delegate from event → device */
+    private Optional<DeviceType> determineType(HidServicesEvent event) {
+        return determineType(event.getHidDevice());
+    }
+
     public void close() {
         try {
-            hidServices.shutdown();
+            if (hidServices != null) {
+                hidServices.shutdown();
+            }
         } catch (Exception e) {
             log.error("Error occurred when closing device", e);
         }

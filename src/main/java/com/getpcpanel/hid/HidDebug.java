@@ -15,6 +15,8 @@ public class HidDebug {
 
     @SneakyThrows
     public HidDebug() {
+        // NOTE: USERPROFILE is Windows-specific; on macOS this will be null.
+        // For now keep it as-is since HidDebug isn't used in normal startup.
         var outputFile = new File(System.getenv("USERPROFILE") + "/.pcpanel/hid-debug.txt");
         outputFile.getParentFile().mkdirs();
         writer = new PrintWriter(new FileOutputStream(outputFile));
@@ -36,16 +38,25 @@ public class HidDebug {
 
     private HidServicesListener buildListener() {
         return new HidServicesListener() {
-            @Override public void hidDeviceAttached(HidServicesEvent event) {
+            @Override
+            public void hidDeviceAttached(HidServicesEvent event) {
                 write("Device attached: " + event);
             }
 
-            @Override public void hidDeviceDetached(HidServicesEvent event) {
+            @Override
+            public void hidDeviceDetached(HidServicesEvent event) {
                 write("Device detached: " + event);
             }
 
-            @Override public void hidFailure(HidServicesEvent event) {
+            @Override
+            public void hidFailure(HidServicesEvent event) {
                 write("Hid failure: " + event);
+            }
+
+            @Override
+            public void hidDataReceived(HidServicesEvent event) {
+                // New method required by hid4java 0.8.0
+                write("Hid data received: " + event);
             }
         };
     }
