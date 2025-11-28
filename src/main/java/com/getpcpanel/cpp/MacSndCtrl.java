@@ -12,6 +12,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.springframework.stereotype.Service;
 
@@ -27,9 +30,16 @@ public class MacSndCtrl implements ISndCtrl {
     private static final Collection<AudioDevice> EMPTY_DEVICES = Collections.emptyList();
     private static final Collection<AudioSession> EMPTY_SESSIONS = Collections.emptyList();
     private static final List<RunningApplication> EMPTY_APPS = Collections.emptyList();
+    private static final Pattern APP_PATH = Pattern.compile("(/.*?\\.app/Contents/MacOS/[^\\s]+)");
+    private static final Pattern LSAPP_PID = Pattern.compile("pid:\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern LSAPP_NAME = Pattern.compile("name:\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
+    private static final Pattern LSAPP_BUNDLE = Pattern.compile("bundleID:\"?([^\"]+)\"?", Pattern.CASE_INSENSITIVE);
+    private static final Pattern LSAPP_EXEC = Pattern.compile("executable\\s+path:\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
 
     /** Cache bundle-id -> app path so we do not shell out repeatedly. */
     private final Map<String, File> bundleIdPathCache = new ConcurrentHashMap<>();
+    private volatile int lastSystemVolume = -1;
+    private volatile long lastSystemVolumeMs = 0L;
 
     // Cached list of running applications at startup
     private volatile List<RunningApplication> runningApplications = EMPTY_APPS;
@@ -132,7 +142,7 @@ public class MacSndCtrl implements ISndCtrl {
     @Override
     public List<RunningApplication> getRunningApplications() {
         // Refresh on every call so the UI stays in sync with current running apps
-        runningApplications = loadRunningApplicationsFromAppleScript();
+        runningApplications = loadRunningApplications();
         return List.copyOf(runningApplications);
     }
 
@@ -240,6 +250,167 @@ public class MacSndCtrl implements ISndCtrl {
         }
     }
 
+    /**
+     * Try AppleScript first (best names/icons), then fall back to ps-based discovery
+     * so we still show something even if accessibility permissions are missing.
+     */
+    private List<RunningApplication> loadRunningApplications() {
+        var fromAppleScript = loadRunningApplicationsFromAppleScript();
+        if (!fromAppleScript.isEmpty()) {
+            return fromAppleScript;
+        }
+
+        var fromLsappinfo = loadRunningApplicationsFromLsappinfo();
+        if (!fromLsappinfo.isEmpty()) {
+            return fromLsappinfo;
+        }
+
+        var fromPs = loadRunningApplicationsFromPs();
+        if (fromPs.isEmpty()) {
+            log.warn("No running applications detected via AppleScript or ps fallback");
+            return EMPTY_APPS;
+        }
+
+        log.debug("Using ps fallback for running applications: {}", fromPs);
+        return fromPs;
+    }
+
+    private List<RunningApplication> loadRunningApplicationsFromLsappinfo() {
+        List<RunningApplication> apps = new ArrayList<>();
+        try {
+            Process p = new ProcessBuilder("lsappinfo", "list").start();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isBlank()) {
+                        continue;
+                    }
+
+                    Matcher pidM = LSAPP_PID.matcher(line);
+                    Matcher nameM = LSAPP_NAME.matcher(line);
+                    Matcher execM = LSAPP_EXEC.matcher(line);
+                    Matcher bundleM = LSAPP_BUNDLE.matcher(line);
+
+                    if (!pidM.find()) {
+                        continue;
+                    }
+                    int pid = Integer.parseInt(pidM.group(1));
+
+                    String name = nameM.find() ? nameM.group(1) : null;
+                    String execPath = execM.find() ? execM.group(1) : null;
+                    String bundleId = bundleM.find() ? bundleM.group(1) : null;
+
+                    File executable = null;
+                    if (execPath != null) {
+                        File path = new File(execPath);
+                        if (path.exists()) {
+                            executable = path;
+                        }
+                    }
+                    if (executable == null) {
+                        executable = resolveBundlePath(bundleId);
+                    }
+                    if (executable == null) {
+                        continue;
+                    }
+
+                    apps.add(new RunningApplication(pid, executable, name != null ? name : executable.getName()));
+                }
+            }
+            p.waitFor();
+        } catch (Exception e) {
+            log.debug("lsappinfo-based running-app fallback failed", e);
+        }
+
+        return apps;
+    }
+
+    /**
+     * Very lightweight fallback that uses ps to find foreground-style apps (.app bundles).
+     */
+    private List<RunningApplication> loadRunningApplicationsFromPs() {
+        List<RunningApplication> apps = new ArrayList<>();
+        try {
+            // Grab pid + user + full command so we can filter to the current user
+            Process p = new ProcessBuilder("ps", "-Ao", "pid=,user=,command=").start();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isBlank()) {
+                        continue;
+                    }
+                    String[] split = line.split("\\s+", 3);
+                    if (split.length < 3) {
+                        continue;
+                    }
+                    String pidStr = split[0];
+                    String user = split[1];
+                    String cmdLine = split[2];
+
+                    // Ignore other users/system daemons; we just want the current user's apps
+                    if (!System.getProperty("user.name", "").equals(user)) {
+                        continue;
+                    }
+
+                    int pid;
+                    try {
+                        pid = Integer.parseInt(pidStr);
+                    } catch (NumberFormatException ex) {
+                        continue;
+                    }
+
+                    // Try to capture a full .app path even when it has spaces
+                    File exec = extractExecutablePath(cmdLine);
+                    if (exec == null) {
+                        continue;
+                    }
+                    if (!exec.exists()) {
+                        continue;
+                    }
+
+                    // No longer require ".app" in the path; show whatever the user owns
+                    String name = exec.getName();
+                    apps.add(new RunningApplication(pid, exec, name));
+                }
+            }
+            p.waitFor();
+        } catch (Exception e) {
+            log.warn("ps-based running-app fallback failed", e);
+        }
+
+        // Deduplicate by executable path to keep the list short for the picker
+        return apps.stream()
+                   .collect(Collectors.toMap(ra -> ra.file().getAbsolutePath(), ra -> ra, (a, b) -> a))
+                   .values()
+                   .stream()
+                   .toList();
+    }
+
+    private File extractExecutablePath(String cmdLine) {
+        // Prefer full .app bundle path if present
+        Matcher m = APP_PATH.matcher(cmdLine);
+        if (m.find()) {
+            var path = new File(m.group(1));
+            if (path.exists()) {
+                return path;
+            }
+        }
+
+        // Fallback: first token (may be truncated if there were spaces)
+        String[] parts = cmdLine.split("\\s+");
+        if (parts.length == 0) {
+            return null;
+        }
+        var path = new File(parts[0]);
+        if (path.exists()) {
+            return path;
+        }
+
+        return null;
+    }
+
     @SuppressWarnings("unused")
     private static String stripQuotes(String s) {
         if (s == null) {
@@ -313,7 +484,20 @@ public class MacSndCtrl implements ISndCtrl {
 
     private void setSystemOutputVolume(float volume) {
         int vol = Math.max(0, Math.min(100, Math.round(volume * 100)));
-        run("osascript", "-e", "set volume output volume " + vol);
+
+        // Avoid spamming osascript when the value has not changed or only changed by a tiny amount very quickly
+        long now = System.currentTimeMillis();
+        if (vol == lastSystemVolume) {
+            return;
+        }
+        if (now - lastSystemVolumeMs < 35 && Math.abs(vol - lastSystemVolume) < 2) {
+            return;
+        }
+
+        lastSystemVolume = vol;
+        lastSystemVolumeMs = now;
+
+        run("osascript", "-e", "set volume output volume " + vol + " without output muted");
     }
 
     private void setSystemMute(boolean mute) {
@@ -335,8 +519,13 @@ public class MacSndCtrl implements ISndCtrl {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
                 String line = reader.readLine();
                 if (line != null) {
+                    StringBuilder sb = new StringBuilder(line);
+                    String extra;
+                    while ((extra = reader.readLine()) != null) {
+                        sb.append('\n').append(extra);
+                    }
                     p.waitFor();
-                    return line;
+                    return sb.toString();
                 }
             }
             p.waitFor();
