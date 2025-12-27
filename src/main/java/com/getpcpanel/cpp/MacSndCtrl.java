@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -114,7 +115,20 @@ public class MacSndCtrl implements ISndCtrl {
 
     @Override
     public Collection<AudioSession> getAllSessions() {
-        return EMPTY_SESSIONS;
+        List<RunningApplication> apps = loadRunningApplicationsFromBgm();
+        if (apps.isEmpty() && bgmAppleScriptAvailable) {
+            apps = loadRunningApplicationsFromBgmAppleScript();
+        }
+        if (apps.isEmpty()) {
+            return EMPTY_SESSIONS;
+        }
+        AtomicInteger fallbackPid = new AtomicInteger(0);
+        return apps.stream()
+                   .map(app -> {
+                       int pid = app.pid() > 0 ? app.pid() : -fallbackPid.incrementAndGet();
+                       return new AudioSession(null, pid, app.file(), app.name(), null, 1f, false);
+                   })
+                   .toList();
     }
 
     @Override
@@ -358,9 +372,9 @@ public class MacSndCtrl implements ISndCtrl {
             JsonNode root = MAPPER.readTree(output);
             if (root.isArray()) {
                 for (JsonNode node : root) {
-                    int pid = node.path("pid").asInt(-1);
+                    int pid = firstInt(node, "pid", "processId", "processID");
                     if (pid < 0) {
-                        continue;
+                        pid = 0;
                     }
                     String bundle = firstNonBlank(node.path("bundleId").asText(null),
                                                   node.path("bundleID").asText(null),
@@ -411,16 +425,18 @@ public class MacSndCtrl implements ISndCtrl {
                     continue;
                 }
                 String[] parts = line.split("\\s+");
-                if (parts.length < 2) {
-                    continue;
+                int pid = 0;
+                String name;
+                if (parts.length >= 2) {
+                    try {
+                        pid = Integer.parseInt(parts[0]);
+                        name = parts[1];
+                    } catch (NumberFormatException ex) {
+                        name = parts[0];
+                    }
+                } else {
+                    name = parts[0];
                 }
-                int pid;
-                try {
-                    pid = Integer.parseInt(parts[0]);
-                } catch (NumberFormatException ex) {
-                    continue;
-                }
-                String name = parts[1];
                 File executable = resolveExecutable(null, pid, name);
                 apps.add(new RunningApplication(pid, executable, name));
             }
@@ -741,12 +757,7 @@ public class MacSndCtrl implements ISndCtrl {
             return false;
         }
         String volStr = String.format(Locale.US, "%.3f", Math.max(0f, Math.min(1f, volume)));
-        String output = runBgmAndCapture("set-app-volume", normalized, volStr);
-        if (output == null) {
-            log.debug("bgm set-app-volume returned null for {}", normalized);
-            return false;
-        }
-        return true;
+        return runBgmCommand("set-app-volume", normalized, volStr);
     }
 
     private boolean setBgmMute(String target, boolean mute) {
@@ -758,12 +769,7 @@ public class MacSndCtrl implements ISndCtrl {
             return false;
         }
         String muteStr = mute ? "on" : "off";
-        String output = runBgmAndCapture("set-app-mute", normalized, muteStr);
-        if (output == null) {
-            log.debug("bgm set-app-mute returned null for {}", normalized);
-            return false;
-        }
-        return true;
+        return runBgmCommand("set-app-mute", normalized, muteStr);
     }
 
     private boolean setBgmVolumeViaAppleScript(String target, float volume) {
@@ -876,6 +882,56 @@ public class MacSndCtrl implements ISndCtrl {
         return null;
     }
 
+    private record CommandResult(int exitCode, String output) {
+    }
+
+    private CommandResult runAndCaptureResult(String... cmd) {
+        try {
+            Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+            StringBuilder output = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                boolean first = true;
+                while ((line = reader.readLine()) != null) {
+                    if (!first) {
+                        output.append('\n');
+                    }
+                    output.append(line);
+                    first = false;
+                }
+            }
+            int exitCode = p.waitFor();
+            return new CommandResult(exitCode, output.toString());
+        } catch (IOException e) {
+            log.warn("Command failed: {}", String.join(" ", cmd), e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Command interrupted: {}", String.join(" ", cmd));
+        }
+        return null;
+    }
+
+    private boolean runBgmCommand(String... args) {
+        if (bgmPath == null) {
+            return false;
+        }
+        String[] cmd = new String[args.length + 1];
+        cmd[0] = bgmPath;
+        System.arraycopy(args, 0, cmd, 1, args.length);
+        CommandResult result = runAndCaptureResult(cmd);
+        if (result == null) {
+            return false;
+        }
+        if (result.exitCode() != 0) {
+            log.warn("bgm command failed (exit {}): {}", result.exitCode(), String.join(" ", cmd));
+            if (result.output() != null && !result.output().isBlank()) {
+                log.warn("bgm output: {}", result.output());
+            }
+            return false;
+        }
+        return true;
+    }
+
     private String runBgmAndCapture(String... args) {
         if (bgmPath == null) {
             return null;
@@ -883,7 +939,18 @@ public class MacSndCtrl implements ISndCtrl {
         String[] cmd = new String[args.length + 1];
         cmd[0] = bgmPath;
         System.arraycopy(args, 0, cmd, 1, args.length);
-        return runAndCapture(cmd);
+        CommandResult result = runAndCaptureResult(cmd);
+        if (result == null) {
+            return null;
+        }
+        if (result.exitCode() != 0) {
+            log.warn("bgm command failed (exit {}): {}", result.exitCode(), String.join(" ", cmd));
+            if (result.output() != null && !result.output().isBlank()) {
+                log.warn("bgm output: {}", result.output());
+            }
+            return null;
+        }
+        return result.output();
     }
 
     private static String escapeAppleScriptString(String s) {
@@ -900,5 +967,31 @@ public class MacSndCtrl implements ISndCtrl {
             }
         }
         return null;
+    }
+
+    private static int firstInt(JsonNode node, String... fields) {
+        if (node == null || fields == null) {
+            return -1;
+        }
+        for (String field : fields) {
+            if (field == null) {
+                continue;
+            }
+            JsonNode value = node.get(field);
+            if (value == null) {
+                continue;
+            }
+            if (value.isNumber()) {
+                return value.asInt();
+            }
+            if (value.isTextual()) {
+                try {
+                    return Integer.parseInt(value.asText());
+                } catch (NumberFormatException ex) {
+                    // ignore
+                }
+            }
+        }
+        return -1;
     }
 }

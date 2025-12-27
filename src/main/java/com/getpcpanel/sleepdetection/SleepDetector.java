@@ -1,6 +1,9 @@
 package com.getpcpanel.sleepdetection;
 
+import java.util.concurrent.TimeUnit;
+
 import org.springframework.context.event.EventListener;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import com.getpcpanel.device.Device;
@@ -20,9 +23,12 @@ import lombok.extern.log4j.Log4j2;
 @RequiredArgsConstructor
 public final class SleepDetector {
     private static final LightingConfig ALL_OFF = LightingConfig.createAllColor(Color.BLACK);
+    private static final long RESUME_GAP_NANOS = TimeUnit.SECONDS.toNanos(30);
+    private static final long RESUME_CHECK_DELAY_MS = 5_000L;
     private final DeviceScanner deviceScanner;
     private final OutputInterpreter outputInterpreter;
     private final DeviceHolder devices;
+    private volatile long lastResumeCheckNanos = System.nanoTime();
 
     @PostConstruct
     public void init() {
@@ -34,6 +40,17 @@ public final class SleepDetector {
         switch (event.type()) {
             case goingToSuspend, locked -> onSuspended(false);
             case resumedFromSuspend, unlocked -> onResumed();
+        }
+    }
+
+    @Scheduled(fixedDelay = RESUME_CHECK_DELAY_MS)
+    public void detectResumeGap() {
+        long now = System.nanoTime();
+        long delta = now - lastResumeCheckNanos;
+        lastResumeCheckNanos = now;
+        if (delta > RESUME_GAP_NANOS) {
+            log.debug("Detected sleep gap ({} ms); resending lighting", TimeUnit.NANOSECONDS.toMillis(delta));
+            onResumed();
         }
     }
 
